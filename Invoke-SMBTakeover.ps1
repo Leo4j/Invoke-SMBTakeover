@@ -22,7 +22,11 @@ function Invoke-SMBTakeover {
                 $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
                 $state = if ($svc -and $svc.Status -eq 'Running') { 'Running' } else { 'Stopped' }
                 # Start mode and path
-                $wmi = Get-WmiObject -Class Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+                $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+                if (-not $wmi) {
+                    # srv2/srvnet are file-system drivers, not in Win32_Service
+                    $wmi = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+                }
                 $mode = if ($wmi) { $wmi.StartMode.ToUpper() } else { 'UNKNOWN' }
                 $path = if ($wmi) { $wmi.PathName } else { '' }
 
@@ -39,24 +43,34 @@ function Invoke-SMBTakeover {
         }
         'start' {
             CheckAdminRights
-            # Configure and start
+            # Re-enable the file-system drivers first: they can be left DISABLED after a
+            # previous stop, which makes LanmanServer fail to start (error 1068).
+            Set-Service -Name 'srv2'   -StartupType Manual    -ErrorAction SilentlyContinue
+            Set-Service -Name 'srvnet' -StartupType Manual    -ErrorAction SilentlyContinue
             Set-Service -Name 'LanmanServer' -StartupType Automatic -ErrorAction SilentlyContinue
             Start-Service -Name 'LanmanServer' -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            $state = (Get-Service -Name 'LanmanServer' -ErrorAction SilentlyContinue).Status
+            $bound = (Get-Service -Name 'srvnet' -ErrorAction SilentlyContinue).Status -eq 'Running'
 
             Write-Host "`n  -------------RESUMING SMB SERVICES----------`n"
+            Write-Host "  [*] srv2"
+            Write-Host "       |--- action: starttype=Manual"
+            Write-Host "  [*] srvnet"
+            Write-Host "       |--- action: starttype=Manual"
             Write-Host "  [*] LanmanServer"
-            Write-Host "       |--- action: starttype=Auto"
-            Write-Host "  [*] LanmanServer"
-            Write-Host "       |--- action: Started`n"
-            Write-Host "  [+] 445/tcp bound - TRUE`n"
+            Write-Host "       |--- action: starttype=Auto, state=$state`n"
+            Write-Host "  [+] 445/tcp bound - $(if ($bound) { 'TRUE' } else { 'FALSE' })`n"
         }
         'stop' {
             CheckAdminRights
-            # Disable and stop
+            # Disable and stop. Stop in dependency order (LanmanServer -> srv2 -> srvnet).
+            # Only LanmanServer uses -Force (it has dependent services); force-stopping
+            # the file-system drivers leaves them broken/disabled.
             Set-Service -Name 'LanmanServer' -StartupType Disabled -ErrorAction SilentlyContinue
-            foreach ($svc in $services) {
-                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
-            }
+            Stop-Service -Name 'LanmanServer' -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name 'srv2'   -ErrorAction SilentlyContinue
+            Stop-Service -Name 'srvnet' -ErrorAction SilentlyContinue
 
             Write-Host "`n  -------------STOPPING SMB SERVICES----------`n"
             Write-Host "  [*] LanmanServer"
